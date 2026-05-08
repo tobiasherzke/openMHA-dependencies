@@ -1,0 +1,110 @@
+name: Build sccn/liblsl with MinGW Windows as DLLs
+
+on:
+  push:
+    branches: ['*']
+    paths:
+      - '.github/workflows/liblsl_mingw.yml'
+  release:
+    types: ['created']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LIBLSL_REF: v1.17.7
+
+jobs:
+  build:
+    name: liblsl MinGW ${{ matrix.msys }} ${{ matrix.lib_type }}
+    strategy:
+      matrix:
+        include:
+          - { runs_on: windows-latest, msys: ucrt64,     lib_type: DLL }
+          - { runs_on: windows-11-arm, msys: clangarm64, lib_type: DLL }
+        # - { runs_on: windows-latest, msys: ucrt64,     lib_type: static }
+        # - { runs_on: windows-11-arm, msys: clangarm64, lib_type: static }
+    runs-on: ${{ matrix.runs_on }}
+    defaults:
+      run:
+        shell: 'msys2 {0}'
+    steps:
+
+    - name: Checkout liblsl at the specified version tag
+      uses: actions/checkout@v5
+      with:
+        repository: sccn/liblsl
+        ref: ${{ env.LIBLSL_REF }}
+
+    - name: Install MinGW build tools
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: ${{matrix.msys}}
+        update: true
+        cache: true
+        install: >-
+            git
+            make
+            zip
+        pacboy: >-
+            toolchain:p
+            cmake:p
+            ninja:p
+
+    - name: Gather liblsl's git info for embedding into the build
+      id: liblsl_git
+      shell: bash
+      run: |
+        echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Configure CMake for a Release build (either DLL or static lib)
+      run: |
+           cmake --version
+           cmake -S . -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=${PWD}/install \
+                -DLSL_UNITTESTS=ON \
+                -DLSL_BUILD_STATIC=${{ matrix.lib_type == 'DLL' && 'OFF' || 'ON' }} \
+                -Dlslgitrevision=${{ steps.liblsl_git.outputs.sha }} \
+                -Dlslgitbranch=${LIBLSL_REF} \
+                -DLSL_OPTIMIZATIONS=OFF \
+                -G Ninja
+
+    - name: Build and install
+      run: cmake --build build --target install --config Release -j --verbose
+
+    - name: Copy license file
+      run: |
+           cp LICENSE install/
+
+    - name: Upload install dir
+      uses: actions/upload-artifact@master
+      with:
+        name: liblsl_mingw_${{ matrix.msys }}_${{ matrix.lib_type }}_artifacts
+        path: install
+
+    - name: unit tests (internal functions)
+      run: 'install/bin/lsl_test_internal --order rand --wait-for-keypress never --durations yes'
+      timeout-minutes: 5
+      if: matrix.msys == 'ucrt64' # skip experimental clangarm64 builds
+
+    - name: unit tests (exported functions)
+      run: install/bin/lsl_test_exported --wait-for-keypress never --durations yes
+      timeout-minutes: 5
+      if: matrix.msys == 'ucrt64' # skip experimental clangarm64 builds
+
+    - name: Create release zip
+      if: github.event_name == 'release'
+      run: |
+           version="${LIBLSL_REF#v}"
+           asset_name="liblsl-${version}-MinGW-${{ matrix.msys }}-${{ matrix.lib_type }}.zip"
+           mkdir -p release-assets
+           cd install
+           zip -r "../release-assets/${asset_name}" .
+
+    - name: Upload release assets
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v3
+      with:
+        files: release-assets/*.zip
